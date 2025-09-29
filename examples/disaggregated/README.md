@@ -254,6 +254,62 @@ TensorRT LLM will automatically register any newly launched server with the ETCD
 
 When removing servers, special attention is required in the current version. You need to first remove the corresponding key from the ETCD server. After you see the log message "Server xxxx is removed," you can then safely shut down the server. This part will be improved soon.
 
+## Mixed Precision Context and Generation
+
+In disaggregated serving, the context workers and generation workers have different performance characteristics: context workers are typically compute-bound while generation workers are memory-bound. By running these workers with different precisions, you can optimize resource utilization and maximize overall throughput.
+
+### Prerequisites
+
+To enable mixed precision serving, you'll need:
+1. A quantized checkpoint created with [TensorRT Model Optimizer](https://github.com/NVIDIA/TensorRT-Model-Optimizer)
+2. The original unquantized checkpoint
+3. Both checkpoints must use the same KV cache dtype to ensure compatibility when transferring KV cache between context and generation servers
+
+### Example (BF 16 Prefill, FP 8 Decode)
+
+A quantized checkpoint can be created `--kv_cache_qformat none` so that the KV cache is not quantized and its dtype matches the unquantized model. 
+
+```bash
+python $MODELOPT_ROOT/examples/llm_ptq/hf_ptq.py \
+    --pyt_ckpt_path=meta-llama/Llama-3.1-8B-Instruct \
+    --export_path=./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
+    --sparsity_fmt=dense \
+    --qformat=fp8 \
+    --calib_size=512 \
+    --batch_size=8 \
+    --inference_tensor_parallel=1 \
+    --inference_pipeline_parallel=1 \
+    --kv_cache_qformat none \
+    --export_fmt=hf
+```
+
+```bash
+# Start context servers with original BF16 checkpoint
+CUDA_VISIBLE_DEVICES=0 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
+    --host localhost --port 8001 \
+    --server_role CONTEXT \
+    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_ctx_0 &
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve meta-llama/Llama-3.1-8B-Instruct \
+    --host localhost --port 8002 \
+    --server_role CONTEXT \
+    --extra_llm_api_options ./ctx_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_ctx_1 &
+
+# Start generation server with FP8 quantized checkpoint
+CUDA_VISIBLE_DEVICES=2 trtllm-serve ./weights/Llama-3.1-8B-Instruct-FP8-KV-BF16 \
+    --host localhost --port 8003 \
+    --server_role GENERATION \
+    --extra_llm_api_options ./gen_extra-llm-api-config.yaml \
+    --metadata_server_config_file ./metadata_config.yaml &> log_gen_0 &
+
+# Start disaggregated server
+trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
+```
+
+You can also run FP8 for context and BF16 for generation, as long as the KV-cache dtype is consistent across all workers.
+
 ## Startup Procedure with MPI Worker (Deprecated)
 
 In the past, we used `disaggregated_mpi_worker` to allow context nodes and generation nodes to operate within the same MPI world. However, this approach conflicts with the dynamic node addition and removal functionality. As a result, disaggregated_mpi_worker has been marked as deprecated, and the corresponding examples will be gradually removed.
